@@ -1,12 +1,15 @@
 // functions/predict.js
 // Netlify Function: AI Trade Pilot predictor (stocks + forex)
-// Free Alpha Vantage endpoints + safe fallbacks for missing data
+// Free Alpha Vantage endpoints + strong error checks + fallback mode
 
+// node-fetch v3 is ESM; dynamic import works in CommonJS Netlify functions
 const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
+/* =========================
+   Indicator helpers
+   ========================= */
 function SMA(arr, n) {
-  const out = [];
-  let s = 0;
+  const out = []; let s = 0;
   for (let i = 0; i < arr.length; i++) {
     s += arr[i];
     if (i >= n) s -= arr[i - n];
@@ -16,8 +19,7 @@ function SMA(arr, n) {
 }
 function EMA(arr, n) {
   if (!arr.length) return [];
-  const out = [];
-  const k = 2 / (n + 1);
+  const out = []; const k = 2 / (n + 1);
   let prev = arr[0];
   for (let i = 0; i < arr.length; i++) {
     prev = i === 0 ? arr[0] : arr[i] * k + prev * (1 - k);
@@ -27,16 +29,14 @@ function EMA(arr, n) {
 }
 function RSI(closes, period = 14) {
   if (closes.length < period + 1) return Array(closes.length).fill(null);
-  let gains = 0,
-    losses = 0;
+  let gains = 0, losses = 0;
   const rsi = Array(closes.length).fill(null);
   for (let i = 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
     gains += Math.max(0, diff);
     losses += Math.max(0, -diff);
     if (i === period) {
-      const avgG = gains / period,
-        avgL = losses / period;
+      const avgG = gains / period, avgL = losses / period;
       const rs = avgL === 0 ? 100 : avgG / avgL;
       rsi[i] = 100 - 100 / (1 + rs);
     } else if (i > period) {
@@ -45,8 +45,7 @@ function RSI(closes, period = 14) {
       const prevL = rsi.avgL ?? losses / period;
       const avgG = ((prevG * (period - 1)) + Math.max(0, d)) / period;
       const avgL = ((prevL * (period - 1)) + Math.max(0, -d)) / period;
-      rsi.avgG = avgG;
-      rsi.avgL = avgL;
+      rsi.avgG = avgG; rsi.avgL = avgL;
       const rs = avgL === 0 ? 100 : avgG / avgL;
       rsi[i] = 100 - 100 / (1 + rs);
     }
@@ -61,15 +60,16 @@ function MACD(closes, fast = 12, slow = 26, signal = 9) {
   const hist = macd.map((x, i) => x - (signalLine[i] || 0));
   return { macd, signal: signalLine, hist };
 }
+
+/* =========================
+   Tiny logistic regression
+   ========================= */
 function fitLogReg(X, y, epochs = 250, lr = 0.03) {
-  const n = X.length,
-    d = X[0].length;
-  let w = Array(d).fill(0),
-    b = 0;
-  const sigmoid = (z) => 1 / (1 + Math.exp(-z));
+  const n = X.length, d = X[0].length;
+  let w = Array(d).fill(0), b = 0;
+  const sigmoid = z => 1 / (1 + Math.exp(-z));
   for (let ep = 0; ep < epochs; ep++) {
-    let dw = Array(d).fill(0),
-      db = 0;
+    let dw = Array(d).fill(0), db = 0;
     for (let i = 0; i < n; i++) {
       let z = b;
       for (let j = 0; j < d; j++) z += w[j] * X[i][j];
@@ -82,21 +82,25 @@ function fitLogReg(X, y, epochs = 250, lr = 0.03) {
     b -= (lr * db) / n;
   }
   return {
-    w,
-    b,
+    w, b,
     predictProb: (x) => {
       let z = b;
       for (let j = 0; j < x.length; j++) z += w[j] * x[j];
       return 1 / (1 + Math.exp(-z));
-    },
+    }
   };
 }
 
+/* =========================
+   Alpha Vantage (free) fetch
+   ========================= */
 async function fetchSeries({ symbol, marketType, interval = "DAILY" }) {
   const key = process.env.ALPHA_VANTAGE_KEY;
   if (!key) throw new Error("Missing ALPHA_VANTAGE_KEY environment variable.");
 
+  // FX intraday is premium on AV free tier → force DAILY for forex
   const useInterval = marketType === "forex" ? "DAILY" : interval;
+
   let url;
   if (marketType === "forex") {
     const from = symbol.slice(0, 3);
@@ -111,14 +115,16 @@ async function fetchSeries({ symbol, marketType, interval = "DAILY" }) {
   }
 
   const r = await fetch(url);
+  if (!r.ok) throw new Error("Network/provider error: " + r.status);
   const data = await r.json();
 
-  // Defensive checks
-  const keyName = Object.keys(data).find((k) => k.includes("Time Series"));
-  if (!keyName || !data[keyName]) {
-    console.warn("Alpha Vantage empty or unexpected response:", data);
-    return [];
-  }
+  // Friendly messages / rate limits
+  if (data.Information) throw new Error("Provider message: " + data.Information);
+  if (data.Note) throw new Error("Rate limit hit: " + data.Note);
+  if (data["Error Message"]) throw new Error("API error: " + data["Error Message"]);
+
+  const keyName = Object.keys(data).find(k => k.includes("Time Series"));
+  if (!keyName || !data[keyName]) return []; // caller handles fallback
 
   const rows = Object.entries(data[keyName])
     .map(([ts, ohlc]) => ({
@@ -134,94 +140,111 @@ async function fetchSeries({ symbol, marketType, interval = "DAILY" }) {
   return rows;
 }
 
+/* =========================
+   Netlify handler
+   ========================= */
 exports.handler = async (event) => {
   try {
     const params = event.queryStringParameters || {};
     const symbol = (params.symbol || "AAPL").toUpperCase();
     const marketType = params.marketType === "forex" ? "forex" : "stock";
-    const interval = (params.interval || "DAILY").toUpperCase();
-    const spreadBps = Number(params.spreadBps || 5);
-    const riskPct = Number(params.riskPct || 1);
-    const lookback = Number(params.lookback || 180);
+    const interval = (params.interval || "DAILY").toUpperCase(); // "DAILY" | "INTRADAY"
+    const spreadBps = Number(params.spreadBps || 5);   // basis points
+    const riskPct   = Number(params.riskPct   || 1);   // % of equity at risk
+    const lookback  = Number(params.lookback  || 180); // bars
 
+    let usingFallback = false;
     let rows = await fetchSeries({ symbol, marketType, interval });
 
-    // Fallback dummy data if API returned nothing
+    // Fallback: create simulated series when AV returns nothing (rate-limit/premium)
     if (!rows || !rows.length) {
+      usingFallback = true;
       const now = Date.now();
-      rows = Array.from({ length: 200 }, (_, i) => ({
-        t: new Date(now - (200 - i) * 86400000).toISOString().split("T")[0],
+      rows = Array.from({ length: Math.max(lookback, 200) }, (_, i) => ({
+        t: new Date(now - (Math.max(lookback, 200) - i) * 86400000).toISOString().split("T")[0],
         open: 100 + Math.sin(i / 10) * 5,
         high: 105 + Math.sin(i / 8) * 5,
-        low: 95 + Math.sin(i / 8) * 5,
-        close: 100 + Math.sin(i / 6) * 5,
+        low:  95 + Math.sin(i / 8) * 5,
+        close: 100 + Math.sin(i / 6) * 5 + (i > 0 ? 0.03 * i : 0), // slight trend so features aren't flat
         volume: 1000,
       }));
     }
 
-    const slice = rows.slice(-lookback);
-    const closes = slice.map((r) => r.close);
+    const slice  = rows.slice(-lookback);
+    const closes = slice.map(r => r.close);
     if (!closes || closes.length < 30) {
       throw new Error("Not enough valid price data for model.");
     }
 
+    // Features
     const sma5 = SMA(closes, 5);
     const sma20 = SMA(closes, 20);
     const { macd } = MACD(closes);
-    const rsi = RSI(closes, 14);
-    const ret = closes.map((v, i) => (i === 0 ? 0 : (v - closes[i - 1]) / closes[i - 1]));
+    const rsi  = RSI(closes, 14);
+    const ret  = closes.map((v, i) => (i === 0 ? 0 : (v - closes[i - 1]) / closes[i - 1]));
     const ret5 = closes.map((v, i) => (i < 5 ? 0 : (v - closes[i - 5]) / closes[i - 5]));
 
-    const X = [],
-      y = [];
+    const X = [], y = [];
     for (let i = 26; i < closes.length - 1; i++) {
       const f = [
         ret[i],
         ret5[i],
-        sma5[i] && sma20[i] ? sma5[i] / sma20[i] - 1 : 0,
-        macd[i],
-        rsi[i] ? (rsi[i] - 50) / 50 : 0,
+        (sma5[i] && sma20[i]) ? (sma5[i] / sma20[i] - 1) : 0,
+        macd[i] || 0,
+        rsi[i] ? (rsi[i] - 50) / 50 : 0
       ];
       const up = closes[i + 1] > closes[i] ? 1 : 0;
-      X.push(f);
-      y.push(up);
+      X.push(f); y.push(up);
     }
-
     if (!X.length) throw new Error("Unable to generate features for training.");
 
-    const model = fitLogReg(X, y, 250, 0.05);
-    const probUp = model.predictProb(X[X.length - 1]);
-    const direction = probUp >= 0.5 ? "LONG" : "SHORT";
-    const confidence = Math.round(100 * Math.abs(probUp - 0.5) * 2);
+    // Model
+    const model   = fitLogReg(X, y, 250, 0.05);
+    const probUp  = model.predictProb(X[X.length - 1]);
+    const direction  = probUp >= 0.5 ? "LONG" : "SHORT";
+    const confidence = Math.round(100 * Math.abs(probUp - 0.5) * 2); // 0..100
 
+    // Sizing (ATR-lite)
     const recentAbs = ret.slice(-20).map(Math.abs);
     const avgAbsRet = recentAbs.length ? recentAbs.reduce((a, b) => a + b, 0) / recentAbs.length : 0.005;
-    const stopPct = Math.max(avgAbsRet, 0.005) * 2;
+    const stopPct   = Math.max(avgAbsRet, 0.005) * 2;
 
-    const accountEquity = 100000;
-    const riskAmount = accountEquity * (riskPct / 100);
-    const lastClose = closes[closes.length - 1];
-    const positionSize = Math.max(1, Math.floor(riskAmount / (stopPct * lastClose)));
+    const accountEquity = 100000;          // demo equity
+    const riskAmount    = accountEquity * (riskPct / 100);
+    const lastClose     = closes[closes.length - 1];
+    const positionSize  = Math.max(1, Math.floor(riskAmount / (stopPct * lastClose)));
 
-    const spreadPct = spreadBps / 10000;
+    // Costs & edge
+    const spreadPct    = spreadBps / 10000;
     const expectedEdge = (probUp - 0.5) * 2 * avgAbsRet - spreadPct;
+
+    // Minimal in-sample backtest (informational only)
+    let pnl = 0, trades = 0, wins = 0;
+    for (let i = 26; i < closes.length - 2; i++) {
+      const p    = model.predictProb(X[i]);
+      const dir  = p >= 0.5 ? 1 : -1;
+      const entry = closes[i + 1];
+      const exit  = closes[i + 2];
+      const move  = (exit - entry) / entry;
+      const stop  = stopPct;
+      let realized = dir * move;
+      if (Math.abs(move) > stop) realized = -stop; // stopped out
+      realized -= spreadPct;
+      pnl += realized; trades++; if (realized > 0) wins++;
+    }
+    const avgTrade = pnl / (trades || 1);
+    const winRate  = trades ? Math.round((wins / trades) * 100) : 0;
 
     return {
       statusCode: 200,
       body: JSON.stringify({
-        symbol,
-        marketType,
-        interval,
-        direction,
-        confidence,
-        probUp,
-        positionSize,
-        stopPct,
-        spreadPct,
-        expectedEdge,
-        backtest: { trades: X.length, avgTrade: avgAbsRet, winRate: 50, cumulative: avgAbsRet * X.length },
+        symbol, marketType, interval,
+        direction, confidence, probUp,
+        positionSize, stopPct, spreadPct, expectedEdge,
+        backtest: { trades, avgTrade, winRate, cumulative: pnl },
         series: slice,
-      }),
+        usingFallback
+      })
     };
   } catch (e) {
     console.error("Predict error:", e);
