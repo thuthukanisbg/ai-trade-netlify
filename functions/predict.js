@@ -1,11 +1,10 @@
 // functions/predict.js
 // Netlify Function: AI Trade Pilot predictor (stocks + forex)
-// Free-plan friendly Alpha Vantage endpoints + graceful error messages
+// Free Alpha Vantage endpoints + strong error checks
 
-// node-fetch v3 is ESM; this dynamic import works in CommonJS Netlify functions
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
-/** ---------- Helpers: indicators ---------- */
+/** ---------- Indicator helpers ---------- */
 function SMA(arr, n) {
   const out = []; let s = 0;
   for (let i = 0; i < arr.length; i++) {
@@ -56,7 +55,7 @@ function MACD(closes, fast = 12, slow = 26, signal = 9) {
   return { macd, signal: signalLine, hist };
 }
 
-/** ---------- Tiny logistic regression ---------- */
+/** ---------- Simple logistic regression ---------- */
 function fitLogReg(X, y, epochs = 250, lr = 0.03) {
   const n = X.length, d = X[0].length;
   let w = Array(d).fill(0), b = 0;
@@ -84,22 +83,19 @@ function fitLogReg(X, y, epochs = 250, lr = 0.03) {
   };
 }
 
-/** ---------- Data fetch (free endpoints) ---------- */
+/** ---------- Alpha Vantage fetch (free endpoints) ---------- */
 async function fetchSeries({ symbol, marketType, interval = "DAILY" }) {
   const key = process.env.ALPHA_VANTAGE_KEY;
   if (!key) throw new Error("Missing ALPHA_VANTAGE_KEY env var in Netlify.");
 
-  // For free plan, forex intraday is premium; force DAILY for FX.
   const useInterval = (marketType === "forex") ? "DAILY" : interval;
-
   let url;
+
   if (marketType === "forex") {
-    // FREE: FX_DAILY
     const from = symbol.slice(0, 3);
     const to = symbol.slice(3, 6);
     url = `https://www.alphavantage.co/query?function=FX_DAILY&from_symbol=${from}&to_symbol=${to}&apikey=${key}`;
   } else {
-    // Stocks: TIME_SERIES_DAILY (safe on free). Intraday 60m may be limited; we attempt it, else fall back to daily.
     if (useInterval === "INTRADAY") {
       url = `https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&interval=60min&symbol=${symbol}&outputsize=compact&apikey=${key}`;
     } else {
@@ -108,77 +104,53 @@ async function fetchSeries({ symbol, marketType, interval = "DAILY" }) {
   }
 
   const r = await fetch(url);
-  if (!r.ok) throw new Error("Data provider error " + r.status);
+  if (!r.ok) throw new Error("Network or provider error: " + r.status);
   const data = await r.json();
 
-  // Handle friendly messages + rate limits
-  if (data.Information) {
-    // Intraday/adjusted/premium or plan restriction
-    throw new Error("Provider message: " + data.Information + " (Try Daily interval or wait a minute if rate-limited.)");
-  }
-  if (data.Note) {
-    throw new Error("Rate limit hit: " + data.Note + " (Wait ~60s and retry.)");
-  }
-  if (data["Error Message"]) {
-    throw new Error("API error: " + data["Error Message"]);
+  if (data.Information) throw new Error("Provider message: " + data.Information);
+  if (data.Note) throw new Error("Rate limit hit: " + data.Note);
+  if (data["Error Message"]) throw new Error("API error: " + data["Error Message"]);
+
+  const keyName = Object.keys(data).find(k => k.includes("Time Series"));
+  if (!keyName || !data[keyName]) {
+    throw new Error("No market data returned (try Daily interval or wait for rate limit).");
   }
 
-  // If intraday failed, fall back to daily
-  let seriesKey = Object.keys(data).find((k) => k.includes("Time Series"));
-  if (!seriesKey && useInterval === "INTRADAY" && marketType === "stock") {
-    const dailyUrl = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${symbol}&outputsize=compact&apikey=${key}`;
-    const r2 = await fetch(dailyUrl);
-    const d2 = await r2.json();
-    if (d2.Information) throw new Error("Provider message: " + d2.Information);
-    if (d2.Note) throw new Error("Rate limit hit: " + d2.Note + " (Wait ~60s and retry.)");
-    seriesKey = Object.keys(d2).find((k) => k.includes("Time Series"));
-    if (!seriesKey) throw new Error("Unexpected response: " + JSON.stringify(d2).slice(0, 200));
-    return Object.entries(d2[seriesKey])
-      .map(([ts, ohlc]) => ({
-        t: ts,
-        open: +ohlc["1. open"],
-        high: +ohlc["2. high"],
-        low: +ohlc["3. low"],
-        close: +ohlc["4. close"],
-        volume: +(ohlc["6. volume"] || ohlc["5. volume"] || 0),
-      }))
-      .sort((a, b) => new Date(a.t) - new Date(b.t));
-  }
-
-  if (!seriesKey) throw new Error("Unexpected response: " + JSON.stringify(data).slice(0, 200));
-
-  const rows = Object.entries(data[seriesKey])
+  const rows = Object.entries(data[keyName])
     .map(([ts, ohlc]) => ({
       t: ts,
       open: +ohlc["1. open"],
       high: +ohlc["2. high"],
       low: +ohlc["3. low"],
       close: +ohlc["4. close"],
-      volume: +(ohlc["6. volume"] || ohlc["5. volume"] || 0),
+      volume: +(ohlc["6. volume"] || ohlc["5. volume"] || 0)
     }))
     .sort((a, b) => new Date(a.t) - new Date(b.t));
 
+  if (!rows.length) throw new Error("Empty dataset (API returned no bars).");
   return rows;
 }
 
-/** ---------- Netlify Handler ---------- */
-exports.handler = async (event, _context) => {
+/** ---------- Netlify handler ---------- */
+exports.handler = async (event) => {
   try {
     const params = event.queryStringParameters || {};
     const symbol = (params.symbol || "AAPL").toUpperCase();
     const marketType = params.marketType === "forex" ? "forex" : "stock";
-    const interval = (params.interval || "DAILY").toUpperCase(); // "DAILY" | "INTRADAY"
-    const spreadBps = Number(params.spreadBps || 5); // basis points
-    const riskPct = Number(params.riskPct || 1);     // % equity risked per trade
+    const interval = (params.interval || "DAILY").toUpperCase();
+    const spreadBps = Number(params.spreadBps || 5);
+    const riskPct = Number(params.riskPct || 1);
     const lookback = Number(params.lookback || 180);
 
     const rows = await fetchSeries({ symbol, marketType, interval });
+    if (!rows || !rows.length) throw new Error("No data retrieved from Alpha Vantage.");
+
     const slice = rows.slice(-lookback);
     const closes = slice.map(r => r.close);
+    if (closes.length < 30) throw new Error("Not enough bars for analysis.");
 
-    // Build feature matrix
     const sma5 = SMA(closes, 5), sma20 = SMA(closes, 20);
-    const { macd, signal, hist } = MACD(closes);
+    const { macd } = MACD(closes);
     const rsi = RSI(closes, 14);
     const ret = closes.map((v, i) => i === 0 ? 0 : (v - closes[i - 1]) / closes[i - 1]);
     const ret5 = closes.map((v, i) => i < 5 ? 0 : (v - closes[i - 5]) / closes[i - 5]);
@@ -196,32 +168,26 @@ exports.handler = async (event, _context) => {
       X.push(f); y.push(up);
     }
 
-    if (X.length < 20) {
-      return { statusCode: 400, body: JSON.stringify({ error: "Not enough data to train", points: rows.length }) };
-    }
+    if (!X.length) throw new Error("Not enough features to train model.");
 
     const model = fitLogReg(X, y, 250, 0.05);
-    const lastIdx = X.length - 1;
-    const probUp = model.predictProb(X[lastIdx]);
+    const probUp = model.predictProb(X[X.length - 1]);
     const direction = probUp >= 0.5 ? "LONG" : "SHORT";
-    const confidence = Math.round(100 * Math.abs(probUp - 0.5) * 2); // 0..100
+    const confidence = Math.round(100 * Math.abs(probUp - 0.5) * 2);
 
-    // Position sizing via ATR-lite (avg abs returns)
     const recentAbs = ret.slice(-20).map(Math.abs);
     const avgAbsRet = recentAbs.length ? recentAbs.reduce((a, b) => a + b, 0) / recentAbs.length : 0.005;
     const atrPct = Math.max(avgAbsRet, 0.005);
     const stopPct = atrPct * 2;
 
-    const accountEquity = 100000;        // virtual equity (UI text explains)
+    const accountEquity = 100000;
     const riskAmount = accountEquity * (riskPct / 100);
     const lastClose = closes[closes.length - 1];
     const positionSize = Math.max(1, Math.floor(riskAmount / (stopPct * lastClose)));
 
-    // Spread + expected edge
     const spreadPct = spreadBps / 10000;
     const expectedEdge = (probUp - 0.5) * 2 * avgAbsRet - spreadPct;
 
-    // Quick in-sample backtest
     let pnl = 0, trades = 0, wins = 0;
     for (let i = 26; i < closes.length - 2; i++) {
       const p = model.predictProb(X[i]);
@@ -231,7 +197,7 @@ exports.handler = async (event, _context) => {
       const move = (exit - entry) / entry;
       const stop = stopPct;
       let realized = dir * move;
-      if (Math.abs(move) > stop) realized = -stop; // stopped out
+      if (Math.abs(move) > stop) realized = -stop;
       realized -= spreadPct;
       pnl += realized;
       trades++;
